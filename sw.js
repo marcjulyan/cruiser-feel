@@ -1,7 +1,7 @@
 // Offline shell for the shift-feel buttons: the page opens with no signal.
 // Same-origin GETs only (ntfy traffic is never touched). Cache first, refreshed in the
 // background, so an update arrives on the next open.
-const CACHE = "shift-feel-v3";
+const CACHE = "shift-feel-v4";
 const SHELL = ["./", "index.html", "manifest.json", "icon-180.png", "icon-512.png"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));

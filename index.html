@@ -59,6 +59,7 @@ const LS = "feel.v1";
 const RESEND_MS = 3 * 3600 * 1000;      // unacked taps are sent again after 3 h
 const KEEP_MS = 21 * 86400 * 1000;      // acked taps kept on the phone for 3 weeks
 let S = { key: null, server: "https://ntfy.sh", taps: [] };
+let wokeJustNow = false;                 // "now tap to rate" for a few s after the screen-on touch
 
 function load() {
   try { const j = JSON.parse(localStorage.getItem(LS) || "null"); if (j && Array.isArray(j.taps)) S = Object.assign(S, j); } catch (e) {}
@@ -121,17 +122,23 @@ async function pollAcks() {
 }
 
 // ---- screen stays on while the app is open (Screen Wake Lock; iOS 16.4+, home-screen apps 18.4+)
-let lock = null, lockState = "off";
-async function keepAwake() {
-  if (!("wakeLock" in navigator) || document.visibilityState !== "visible") { if (!("wakeLock" in navigator)) lockState = "unsupported"; return; }
-  if (lock && !lock.released) return;
-  try {
-    lock = await navigator.wakeLock.request("screen");
-    lockState = "on";
-    lock.addEventListener("release", () => { lockState = "off"; render(); });
-  } catch (e) { lockState = "denied"; }
-  render();
+// lockState: "off" (not on yet), "on", "unsupported" (no API), "unavailable" (refused even after a
+// touch, e.g. Low Power Mode). iOS only grants it after a touch, and Marc's rule (22 Nov): any tap
+// before "screen stays on" shows is only there to get the screen on - never a rating.
+let lock = null, lockState = ("wakeLock" in navigator) ? "off" : "unsupported", asking = null;
+function keepAwake(fromTouch) {
+  if (lockState === "unsupported" || document.visibilityState !== "visible") return Promise.resolve(lockState);
+  if (lock && !lock.released) return Promise.resolve(lockState);
+  if (asking) return asking;
+  asking = navigator.wakeLock.request("screen").then(l => {
+    lock = l; lockState = "on";
+    l.addEventListener("release", () => { lockState = "off"; render(); });
+  }).catch(() => {
+    if (fromTouch) lockState = "unavailable";            // a touch didn't help: don't block ratings
+  }).then(() => { asking = null; render(); return lockState; });
+  return asking;
 }
+function ratingsOpen() { return lockState === "on" || lockState === "unsupported" || lockState === "unavailable"; }
 
 // ---- no accidental ratings: after the app opens or comes back on screen, taps are ignored
 // for GUARD_MS (the tap that wakes the phone / brings the app back must not count)
@@ -160,8 +167,10 @@ function render() {
             : unconf ? `sent · ${unconf} waiting for the Pi`
             : real.length ? "all with the Pi ✓" : "taps are saved even with no signal";
   if (!armed()) line2 = "ready in a moment…";
+  if (armed() && !ratingsOpen()) line2 = "tap once to keep the screen on";
+  else if (wokeJustNow) line2 = "now tap to rate";
   const scr = lockState === "on" ? "screen stays on ✓"
-            : lockState === "denied" ? "tap anywhere to keep the screen on"
+            : lockState === "unavailable" ? "screen may sleep (Low Power Mode / Auto-Lock)"
             : lockState === "unsupported" ? "screen may sleep (see Auto-Lock)" : "";
   st.innerHTML = line1 + "<br>" + line2 + (scr ? "<br><span style='font-size:13px'>" + scr + "</span>" : "");
 }
@@ -173,26 +182,37 @@ function flash(label) {
 }
 
 load(); guard(); render();
+function gate() {
+  // -> true if this touch may be a rating. Not while dimmed after opening, and not before the
+  // screen is kept on: that touch only switches the screen on (grey flash, never saved).
+  if (!armed()) { keepAwake(true); return false; }        // dimmed: wakes the screen, never a rating
+  if (!ratingsOpen()) {
+    flash("undo");
+    keepAwake(true).then(() => { wokeJustNow = true; render(); setTimeout(() => { wokeJustNow = false; render(); }, 4000); });
+    return false;
+  }
+  wokeJustNow = false;
+  return true;
+}
 ["good", "bad", "noise"].forEach(id => {
   const b = document.getElementById(id);
   b.addEventListener("pointerdown", e => {
-    e.preventDefault(); keepAwake();
-    if (!armed()) return;                                // just woke / reopened: not a rating
+    e.preventDefault();
+    if (!gate()) return;
     tap(id); flash(id);                                  // stamp at touch-down
   });
 });
 document.getElementById("undo").addEventListener("pointerdown", e => {
-  e.preventDefault(); keepAwake();
-  if (!armed()) return;
+  e.preventDefault();
+  if (!gate()) return;
   const last = [...S.taps].reverse().find(t => t.label !== "undo" && !S.taps.some(u => u.undoes === t.id));
   if (last) { tap("undo", last.id); flash("undo"); }
 });
 window.addEventListener("online", () => { send(); pollAcks(); });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) { guard(); keepAwake(); send(); pollAcks(); } });
 window.addEventListener("pageshow", e => { if (e.persisted) { guard(); keepAwake(); } });
-// iOS grants the screen wake lock only after a touch: ANY touch asks for it (status area,
-// background, or the dimmed buttons during the guard, none of which count as a rating)
-document.addEventListener("pointerdown", () => keepAwake(), true);
+// any touch outside the buttons (status area, background) also switches the screen on
+document.addEventListener("pointerdown", e => { if (!e.target.closest("button")) keepAwake(true); }, true);
 keepAwake();
 setInterval(send, 15000);
 setInterval(() => { if (Date.now() - lastAckPoll > 60000) pollAcks(); }, 15000);
