@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Shift feel">
+<meta name="theme-color" content="#0b0d12">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-180.png">
+<title>Shift feel</title>
+<!--
+Cruiser shift-feel buttons (offline). Each tap is saved on the phone first, stamped with
+the phone's own clock (UTC ms), then sent whenever there is signal to Marc's private
+ntfy topic. The Pi collects the taps when it is online, files them in the cruiser-logs
+repo (pi_logs/feel_taps/) and acks them; the analysis puts each tap on the right drive's
+timeline using satellite time. No hotspot or Pi connection is needed while driving.
+The topic arrives in the setup link (?k=...) and stays on this phone.
+-->
+<style>
+:root { --bg:#0b0d12; --fg:#f4f4f2; --mut:#8b8d93; }
+* { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+  font-family:-apple-system, system-ui, "Helvetica Neue", Arial, sans-serif; }
+body { display:flex; flex-direction:column; gap:12px;
+  padding:max(14px, env(safe-area-inset-top)) 14px max(14px, env(safe-area-inset-bottom)); user-select:none; -webkit-user-select:none; }
+button { border:0; border-radius:26px; color:#fff; font-weight:800; letter-spacing:1px; font-family:inherit; }
+.big { flex:1; font-size:min(15vw, 64px); transition:transform .08s, filter .08s; }
+.big:active, .big.hit { transform:scale(.97); filter:brightness(1.35); }
+#good { background:#3e7d40; } #bad { background:#a83226; } #noise { background:#2f5ea8; }
+.row { display:flex; align-items:center; gap:14px; min-height:64px; }
+#undo { background:#2a2d33; font-size:22px; padding:0 26px; height:64px; }
+#status { flex:1; text-align:right; color:var(--mut); font-size:15px; line-height:1.35; }
+#status b { color:var(--fg); font-weight:600; }
+#setup { display:none; flex:1; flex-direction:column; justify-content:center; gap:14px; font-size:19px; line-height:1.45; }
+#setup h1 { font-size:26px; margin:0; }
+.flash { position:fixed; inset:0; pointer-events:none; opacity:0; transition:opacity .25s; }
+</style>
+</head>
+<body>
+<div id="setup">
+  <h1>Shift feel buttons</h1>
+  <div id="setupmsg">Open the setup link from the Pi's notification ("Cruiser Pi feel buttons") on this phone.</div>
+</div>
+<button class="big" id="good" data-l="good">GOOD</button>
+<button class="big" id="bad" data-l="bad">BAD</button>
+<button class="big" id="noise" data-l="noise">NOISE</button>
+<div class="row">
+  <button id="undo">UNDO</button>
+  <div id="status">starting…</div>
+</div>
+<div class="flash" id="flash"></div>
+<script>
+"use strict";
+const LS = "feel.v1";
+const RESEND_MS = 3 * 3600 * 1000;      // unacked taps are sent again after 3 h
+const KEEP_MS = 21 * 86400 * 1000;      // acked taps kept on the phone for 3 weeks
+let S = { key: null, server: "https://ntfy.sh", taps: [] };
+
+function load() {
+  try { const j = JSON.parse(localStorage.getItem(LS) || "null"); if (j && Array.isArray(j.taps)) S = Object.assign(S, j); } catch (e) {}
+  // setup link: ?k=<topic>[&s=<server>] (or #k=...). Read on every launch: a home-screen app
+  // has its own storage on iOS, so the key must also live in its start address.
+  const p = new URLSearchParams(location.search.replace(/^\?/, "") || (location.hash || "").replace(/^#/, ""));
+  if (p.get("k")) S.key = p.get("k");
+  if (p.get("s")) S.server = p.get("s");
+  save();
+}
+function save() { try { localStorage.setItem(LS, JSON.stringify(S)); } catch (e) {} }
+function uid() { return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8); }
+
+function tap(label, undoes) {
+  const t = { id: uid(), label: label, utc_ms: Date.now(), tz_min: -new Date().getTimezoneOffset(),
+              sent_ms: 0, acked: false };
+  if (undoes) t.undoes = undoes;
+  S.taps.push(t); save(); render(); send();
+  return t;
+}
+
+let sending = false;
+async function send() {
+  if (sending || !S.key) return;
+  const now = Date.now();
+  const due = S.taps.filter(t => !t.acked && (!t.sent_ms || now - t.sent_ms > RESEND_MS));
+  if (!due.length) return;
+  sending = true;
+  try {
+    for (let i = 0; i < due.length; i += 25) {           // ntfy messages stay well under 4 KB
+      const batch = due.slice(i, i + 25);
+      const body = JSON.stringify({ v: 1, app: "shift-feel", taps: batch.map(t => {
+        const o = { id: t.id, label: t.label, utc_ms: t.utc_ms, tz_min: t.tz_min };
+        if (t.undoes) o.undoes = t.undoes; return o; }) });
+      const r = await fetch(S.server.replace(/\/$/, "") + "/" + encodeURIComponent(S.key),
+                            { method: "POST", body: body, cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const ts = Date.now(); batch.forEach(t => t.sent_ms = ts); save();
+    }
+  } catch (e) { /* no signal: stays on the phone, tried again later */ }
+  sending = false; render();
+}
+
+let lastAckPoll = 0;
+async function pollAcks() {
+  if (!S.key) return;
+  lastAckPoll = Date.now();
+  try {
+    const r = await fetch(S.server.replace(/\/$/, "") + "/" + encodeURIComponent(S.key + "-ack") + "/json?poll=1&since=12h",
+                          { cache: "no-store" });
+    if (!r.ok) return;
+    const txt = await r.text(); const got = new Set();
+    txt.split("\n").forEach(l => { try { const m = JSON.parse(l); if (m.event === "message") {
+      const a = JSON.parse(m.message); (a.ack || []).forEach(id => got.add(id)); } } catch (e) {} });
+    let n = 0; S.taps.forEach(t => { if (!t.acked && got.has(t.id)) { t.acked = true; n++; } });
+    const cut = Date.now() - KEEP_MS; S.taps = S.taps.filter(t => !(t.acked && t.utc_ms < cut));
+    if (n) save();
+  } catch (e) {}
+  render();
+}
+
+function hhmm(ms) { const d = new Date(ms); return d.toTimeString().slice(0, 8); }
+function render() {
+  const st = document.getElementById("status");
+  if (!S.key) { document.getElementById("setup").style.display = "flex";
+    ["good", "bad", "noise"].forEach(id => document.getElementById(id).style.display = "none");
+    st.textContent = "not set up"; return; }
+  const real = S.taps.filter(t => t.label !== "undo");
+  const last = S.taps[S.taps.length - 1];
+  const waiting = S.taps.filter(t => !t.sent_ms).length;
+  const unconf = S.taps.filter(t => t.sent_ms && !t.acked).length;
+  let line1 = last ? `<b>${last.label.toUpperCase()}</b> saved ${hhmm(last.utc_ms)}` : "ready";
+  let line2 = waiting ? `${waiting} on phone, sends when there's signal`
+            : unconf ? `sent · ${unconf} waiting for the Pi`
+            : real.length ? "all with the Pi ✓" : "taps are saved even with no signal";
+  st.innerHTML = line1 + "<br>" + line2;
+}
+
+const COLORS = { good: "#3e7d40", bad: "#a83226", noise: "#2f5ea8", undo: "#555" };
+function flash(label) {
+  const f = document.getElementById("flash"); f.style.background = COLORS[label]; f.style.transition = "none";
+  f.style.opacity = ".55"; requestAnimationFrame(() => { f.style.transition = "opacity .35s"; f.style.opacity = "0"; });
+}
+
+load(); render();
+["good", "bad", "noise"].forEach(id => {
+  const b = document.getElementById(id);
+  b.addEventListener("pointerdown", e => { e.preventDefault(); tap(id); flash(id); });   // stamp at touch-down
+});
+document.getElementById("undo").addEventListener("pointerdown", e => {
+  e.preventDefault();
+  const last = [...S.taps].reverse().find(t => t.label !== "undo" && !S.taps.some(u => u.undoes === t.id));
+  if (last) { tap("undo", last.id); flash("undo"); }
+});
+window.addEventListener("online", () => { send(); pollAcks(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { send(); pollAcks(); } });
+setInterval(send, 15000);
+setInterval(() => { if (Date.now() - lastAckPoll > 60000) pollAcks(); }, 15000);
+send(); pollAcks();
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
+</body>
+</html>
