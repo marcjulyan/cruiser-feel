@@ -161,7 +161,8 @@ function render() {
             : real.length ? "all with the Pi ✓" : "taps are saved even with no signal";
   if (!armed()) line2 = "ready in a moment…";
   const scr = lockState === "on" ? "screen stays on ✓"
-            : lockState === "unsupported" || lockState === "denied" ? "screen may sleep (see Auto-Lock)" : "";
+            : lockState === "denied" ? "tap anywhere to keep the screen on"
+            : lockState === "unsupported" ? "screen may sleep (see Auto-Lock)" : "";
   st.innerHTML = line1 + "<br>" + line2 + (scr ? "<br><span style='font-size:13px'>" + scr + "</span>" : "");
 }
 
@@ -189,6 +190,9 @@ document.getElementById("undo").addEventListener("pointerdown", e => {
 window.addEventListener("online", () => { send(); pollAcks(); });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) { guard(); keepAwake(); send(); pollAcks(); } });
 window.addEventListener("pageshow", e => { if (e.persisted) { guard(); keepAwake(); } });
+// iOS grants the screen wake lock only after a touch: ANY touch asks for it (status area,
+// background, or the dimmed buttons during the guard, none of which count as a rating)
+document.addEventListener("pointerdown", () => keepAwake(), true);
 keepAwake();
 setInterval(send, 15000);
 setInterval(() => { if (Date.now() - lastAckPoll > 60000) pollAcks(); }, 15000);
