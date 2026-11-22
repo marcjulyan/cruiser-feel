@@ -29,6 +29,7 @@ body { display:flex; flex-direction:column; gap:12px;
 button { border:0; border-radius:26px; color:#fff; font-weight:800; letter-spacing:1px; font-family:inherit; }
 .big { flex:1; font-size:min(15vw, 64px); transition:transform .08s, filter .08s; }
 .big:active, .big.hit { transform:scale(.97); filter:brightness(1.35); }
+body.guard .big, body.guard #undo { opacity:.35; filter:saturate(.4); }
 #good { background:#3e7d40; } #bad { background:#a83226; } #noise { background:#2f5ea8; }
 .row { display:flex; align-items:center; gap:14px; min-height:64px; }
 #undo { background:#2a2d33; font-size:22px; padding:0 26px; height:64px; }
@@ -119,6 +120,31 @@ async function pollAcks() {
   render();
 }
 
+// ---- screen stays on while the app is open (Screen Wake Lock; iOS 16.4+, home-screen apps 18.4+)
+let lock = null, lockState = "off";
+async function keepAwake() {
+  if (!("wakeLock" in navigator) || document.visibilityState !== "visible") { if (!("wakeLock" in navigator)) lockState = "unsupported"; return; }
+  if (lock && !lock.released) return;
+  try {
+    lock = await navigator.wakeLock.request("screen");
+    lockState = "on";
+    lock.addEventListener("release", () => { lockState = "off"; render(); });
+  } catch (e) { lockState = "denied"; }
+  render();
+}
+
+// ---- no accidental ratings: after the app opens or comes back on screen, taps are ignored
+// for GUARD_MS (the tap that wakes the phone / brings the app back must not count)
+const GUARD_MS = 1500;
+let armedAt = 0;
+function guard() {
+  armedAt = Date.now() + GUARD_MS;
+  document.body.classList.add("guard");
+  setTimeout(() => { if (Date.now() >= armedAt) { document.body.classList.remove("guard"); render(); } }, GUARD_MS + 20);
+  render();
+}
+function armed() { return Date.now() >= armedAt; }
+
 function hhmm(ms) { const d = new Date(ms); return d.toTimeString().slice(0, 8); }
 function render() {
   const st = document.getElementById("status");
@@ -133,7 +159,10 @@ function render() {
   let line2 = waiting ? `${waiting} on phone, sends when there's signal`
             : unconf ? `sent · ${unconf} waiting for the Pi`
             : real.length ? "all with the Pi ✓" : "taps are saved even with no signal";
-  st.innerHTML = line1 + "<br>" + line2;
+  if (!armed()) line2 = "ready in a moment…";
+  const scr = lockState === "on" ? "screen stays on ✓"
+            : lockState === "unsupported" || lockState === "denied" ? "screen may sleep (see Auto-Lock)" : "";
+  st.innerHTML = line1 + "<br>" + line2 + (scr ? "<br><span style='font-size:13px'>" + scr + "</span>" : "");
 }
 
 const COLORS = { good: "#3e7d40", bad: "#a83226", noise: "#2f5ea8", undo: "#555" };
@@ -142,18 +171,25 @@ function flash(label) {
   f.style.opacity = ".55"; requestAnimationFrame(() => { f.style.transition = "opacity .35s"; f.style.opacity = "0"; });
 }
 
-load(); render();
+load(); guard(); render();
 ["good", "bad", "noise"].forEach(id => {
   const b = document.getElementById(id);
-  b.addEventListener("pointerdown", e => { e.preventDefault(); tap(id); flash(id); });   // stamp at touch-down
+  b.addEventListener("pointerdown", e => {
+    e.preventDefault(); keepAwake();
+    if (!armed()) return;                                // just woke / reopened: not a rating
+    tap(id); flash(id);                                  // stamp at touch-down
+  });
 });
 document.getElementById("undo").addEventListener("pointerdown", e => {
-  e.preventDefault();
+  e.preventDefault(); keepAwake();
+  if (!armed()) return;
   const last = [...S.taps].reverse().find(t => t.label !== "undo" && !S.taps.some(u => u.undoes === t.id));
   if (last) { tap("undo", last.id); flash("undo"); }
 });
 window.addEventListener("online", () => { send(); pollAcks(); });
-document.addEventListener("visibilitychange", () => { if (!document.hidden) { send(); pollAcks(); } });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { guard(); keepAwake(); send(); pollAcks(); } });
+window.addEventListener("pageshow", e => { if (e.persisted) { guard(); keepAwake(); } });
+keepAwake();
 setInterval(send, 15000);
 setInterval(() => { if (Date.now() - lastAckPoll > 60000) pollAcks(); }, 15000);
 send(); pollAcks();
